@@ -1,0 +1,12 @@
+# ==============================================================================
+# BASE DE COMPUTADORES LOCAIS - MODELO DE EXEMPLO
+# Formato: ENDERECO_IP | NOME_DESCRITIVO
+# Linhas iniciadas com '#' sao ignoradas.
+#
+# Copie este arquivo para 'hosts.conf' ou utilize o menu [3] do netmonitor.sh
+# para gerenciar seus computadores interativamente.
+# ==============================================================================
+192.168.1.1   | Roteador Gateway Principal
+192.168.1.10  | Servidor Ubuntu Backup
+192.168.1.11  | Desktop Linux Mint 01
+192.168.1.12  | Estacao Ubuntu Trabalho

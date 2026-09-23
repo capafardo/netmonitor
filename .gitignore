@@ -1,0 +1,13 @@
+# Arquivos de configuracao local e dados de rede privados
+hosts.conf
+settings.conf
+
+# Arquivos temporarios e backups
+*.tmp
+*.bak
+*~
+*.swp
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
