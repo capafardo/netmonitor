@@ -21,13 +21,13 @@ Desenvolvido com foco em ambientes Linux (Ubuntu, Linux Mint, Debian), ele opera
 
 ```text
  ╔══════════════════════════════════════════════════════════════════════════════╗
- ║  ███╗   ██╗███████╗████████╗   ███╗   ███╗ ██████╗ ███╗   ██╗                 ║
- ║  ████╗  ██║██╔════╝╚══██╔══╝   ████╗ ████║██╔═══██╗████╗  ██║                 ║
- ║  ██╔██╗ ██║█████╗     ██║█████╗██╔████╔██║██║   ██║██╔██╗ ██║                 ║
- ║  ██║╚██╗██║██╔══╝     ██║╚════╝██║╚██╔╝██║██║   ██║██║╚██╗██║                 ║
- ║  ██║ ╚████║███████╗   ██║      ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║                 ║
- ║  ╚═╝  ╚═══╝╚══════╝   ╚═╝      ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝                 ║
- ║             [ SISTEMA RETRO DE MONITORAMENTO DE REDE LOCAL ]                   ║
+ ║  ███╗   ██╗███████╗████████╗   ███╗   ███╗ ██████╗ ███╗   ██╗                ║
+ ║  ████╗  ██║██╔════╝╚══██╔══╝   ████╗ ████║██╔═══██╗████╗  ██║                ║
+ ║  ██╔██╗ ██║█████╗     ██║█████╗██╔████╔██║██║   ██║██╔██╗ ██║                ║
+ ║  ██║╚██╗██║██╔══╝     ██║╚════╝██║╚██╔╝██║██║   ██║██║╚██╗██║                ║
+ ║  ██║ ╚████║███████╗   ██║      ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║                ║
+ ║  ╚═╝  ╚═══╝╚══════╝   ╚═╝      ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝                ║
+ ║             [ SISTEMA RETRO DE MONITORAMENTO DE REDE LOCAL ]                 ║
  ║   Ambiente: 100% Offline  •  Tema: Fósforo Verde (Green CRT)  •  v1.0        ║
  ╚══════════════════════════════════════════════════════════════════════════════╝
  ┌────────────┬────────────┬─────────────────┬────────────────────────────────┐
@@ -57,7 +57,7 @@ Desenvolvido com foco em ambientes Linux (Ubuntu, Linux Mint, Debian), ele opera
   - 🔵 **IBM DOS / ANSI:** Cores clássicas estilo Norton Commander / MS-DOS.
   - 🔔 **Alerta Sonoro de Terminal:** Opção de Beep (`\a`) quando máquinas ficam inalcançáveis.
 - **Menu Completo:** Convenção estrita e amigável: **digite `0` para voltar ou sair**.
-- **Autodescoberta de Máquinas:** Varre a tabela ARP do kernel (`ip neigh`) para descobrir novos computadores na LAN sem precisar digitar IPs manualmente.
+- **Varredura e Autodescoberta Ativa na LAN:** Varre ativamente toda a sub-rede local (via detecção veloz com `nmap` ou varredura nativa paralela ICMP + ARP do kernel) para reconhecer automaticamente todas as máquinas na rede local e monitorá-las de forma constante. Novos computadores que entram na rede são identificados dinamicamente em segundo plano.
 
 ---
 
@@ -65,8 +65,8 @@ Desenvolvido com foco em ambientes Linux (Ubuntu, Linux Mint, Debian), ele opera
 
 ### 1. Clonar o repositório
 ```bash
-git clone https://github.com/SEU_USUARIO/pinga-rede.git
-cd pinga-rede
+git clone https://github.com/capafardo/netmonitor.git
+cd netmonitor
 ```
 
 ### 2. Conceder permissão de execução
@@ -104,7 +104,7 @@ chmod +x netmonitor.sh
 
 ## ⚙️ Configuração dos Computadores (`hosts.conf`)
 
-Os hosts são armazenados localmente no arquivo [`hosts.conf`](file:///home/marcelo/projetos/shell/pinga-rede/hosts.conf). Você pode editá-lo pelo próprio menu interativo do script ou diretamente em qualquer editor de texto:
+Os hosts são armazenados localmente no arquivo `hosts.conf`. Você pode editá-lo pelo próprio menu interativo do script ou diretamente em qualquer editor de texto:
 
 ```text
 # Formato: ENDERECO_IP | NOME_DESCRITIVO

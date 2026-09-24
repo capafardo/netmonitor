@@ -84,6 +84,7 @@ carregar_configuracoes() {
     THEME="green"         # green (Fósforo Verde), amber (Âmbar CRT), classic (DOS/ANSI)
     REFRESH_RATE=10       # Segundos entre varreduras contínuas (padrão: 10s)
     BEEP_ON_CHANGE=0      # 1 para alerta sonoro do terminal em mudança de status
+    AUTO_DISCOVERY=1      # 1 para autodescoberta contínua periódica de novas máquinas na rede
     
     if [ -f "$SETTINGS_FILE" ]; then
         # shellcheck source=/dev/null
@@ -98,6 +99,7 @@ salvar_configuracoes() {
 THEME="${THEME}"
 REFRESH_RATE=${REFRESH_RATE}
 BEEP_ON_CHANGE=${BEEP_ON_CHANGE}
+AUTO_DISCOVERY=${AUTO_DISCOVERY}
 EOF
 }
 
@@ -117,7 +119,7 @@ aplicar_tema() {
             C_OFFLINE=$'\033[38;5;130m'
             C_BORDER=$'\033[38;5;208m'
             C_ACCENT=$'\033[38;5;226m'
-            THEME_NAME="Âmbar CRT (Monocromático)"
+            THEME_NAME="Âmbar CRT"
             ;;
         classic)
             # Clássico ANSI / DOS (Ciano, Verde, Vermelho)
@@ -128,7 +130,7 @@ aplicar_tema() {
             C_OFFLINE=$'\033[1;31m'
             C_BORDER=$'\033[1;34m'
             C_ACCENT=$'\033[1;33m'
-            THEME_NAME="IBM DOS / ANSI Color"
+            THEME_NAME="IBM DOS"
             ;;
         *)
             # Padrão: Fósforo Verde (Green CRT / Matrix Terminal)
@@ -140,17 +142,140 @@ aplicar_tema() {
             C_BORDER=$'\033[38;5;34m'
             C_ACCENT=$'\033[38;5;118m'
             THEME="green"
-            THEME_NAME="Fósforo Verde (Green CRT)"
+            THEME_NAME="Fósforo Verde"
             ;;
     esac
 }
 
-# Inicialização da base de computadores caso não exista (sem IPs fictícios)
-inicializar_hosts() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        local gw
-        gw=$(ip route 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+# ------------------------------------------------------------------------------
+# DETECÇÃO DE TOPOLOGIA DA REDE LOCAL E AUTODESCOBERTA
+# ------------------------------------------------------------------------------
+detectar_configuracao_rede() {
+    # 1. Identificar interface de saída conectada ao roteador / gateway
+    NET_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [ -z "$NET_IFACE" ]; then
+        NET_IFACE=$(ip -o -4 addr show up 2>/dev/null | awk -F': ' '$2 !~ /^(lo|docker|br-|veth)/ {print $2; exit}')
+    fi
 
+    # 2. IP do Gateway da rede local
+    NET_GW=$(ip route show default dev "$NET_IFACE" 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+    [ -z "$NET_GW" ] && NET_GW=$(ip route 2>/dev/null | awk '/default/ {print $3}' | head -n 1)
+
+    # 3. IP local desta máquina
+    LOCAL_IP=$(ip -o -4 addr show dev "$NET_IFACE" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -n 1)
+    [ -z "$LOCAL_IP" ] && LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -z "$LOCAL_IP" ] && LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+
+    # 4. CIDR e prefixo da sub-rede local (ex: 192.168.15.0/24)
+    NET_CIDR=$(ip route show dev "$NET_IFACE" proto kernel scope link 2>/dev/null | awk '{print $1}' | head -n 1)
+    if [ -z "$NET_CIDR" ]; then
+        NET_CIDR=$(ip route show dev "$NET_IFACE" scope link 2>/dev/null | awk '{print $1}' | head -n 1)
+    fi
+    if [ -z "$NET_CIDR" ] && [ -n "$LOCAL_IP" ]; then
+        NET_CIDR="$(echo "$LOCAL_IP" | cut -d'.' -f1-3).0/24"
+    fi
+    NET_PREFIX=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
+}
+
+resolver_nome_dispositivo() {
+    local ip="$1"
+    local hint_name="$2"
+
+    if [ "$ip" = "$NET_GW" ]; then
+        echo "Roteador Gateway Principal"
+        return
+    fi
+    if [ "$ip" = "$LOCAL_IP" ]; then
+        echo "Esta Maquina Local (${HOSTNAME:-Linux})"
+        return
+    fi
+
+    # Se hint_name foi fornecido (ex: via nmap)
+    if [ -n "$hint_name" ] && [ "$hint_name" != "_gateway" ] && [ "$hint_name" != "$ip" ]; then
+        echo "$hint_name"
+        return
+    fi
+
+    # Tenta resolução local via getent hosts
+    local hname
+    hname=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -n 1)
+    if [ -n "$hname" ] && [ "$hname" != "_gateway" ] && [ "$hname" != "$ip" ]; then
+        echo "$hname"
+        return
+    fi
+
+    echo "Dispositivo Rede Local ($ip)"
+}
+
+descobrir_maquinas_rede() {
+    local modo_silencioso="${1:-0}"
+    detectar_configuracao_rede
+
+    if [ -z "$NET_IFACE" ] || [ -z "$LOCAL_IP" ]; then
+        [ "$modo_silencioso" -eq 0 ] && echo "Aviso: Nenhuma interface de rede local ativa detectada."
+        return 1
+    fi
+
+    local metodo_scan="Ping Paralelo Nativo (100% Offline)"
+    local ips_descobertos=()
+    declare -A map_hints
+
+    if [ "$modo_silencioso" -eq 0 ]; then
+        printf "%s=== VARREDURA E AUTODESCOBERTA NA REDE LOCAL ===%s\n\n" "${C_ACCENT}" "${RESET}"
+        printf "%s Sub-rede alvo: %s  •  Interface: %s%s\n" "${C_BRIGHT}" "${NET_CIDR:-LAN}" "${NET_IFACE}" "${RESET}"
+        printf "%s Varrendo a rede local em busca de máquinas ativas... Aguarde.%s\n\n" "${C_DIM}" "${RESET}"
+    fi
+
+    # 1. Varredura nativa em Bash puro (dispara pings paralelos para popular tabela ARP do kernel)
+    if [ -n "$NET_PREFIX" ]; then
+        for i in $(seq 1 254); do
+            ping -n -c 1 -W 1 "${NET_PREFIX}.${i}" >/dev/null 2>&1 &
+        done
+        wait 2>/dev/null
+    fi
+
+    # 2. Se nmap estiver disponível, aproveita para coletar nomes resolvidos
+    if command -v nmap >/dev/null 2>&1 && [ -n "$NET_CIDR" ]; then
+        metodo_scan="Nmap Discovery + Kernel ARP"
+        while read -r linha; do
+            if [[ "$linha" =~ Nmap\ scan\ report\ for\ (.+)\ \(([0-9.]+)\) ]]; then
+                local h="${BASH_REMATCH[1]}"
+                local ip="${BASH_REMATCH[2]}"
+                ips_descobertos+=("$ip")
+                map_hints["$ip"]="$h"
+            elif [[ "$linha" =~ Nmap\ scan\ report\ for\ ([0-9.]+) ]]; then
+                local ip="${BASH_REMATCH[1]}"
+                ips_descobertos+=("$ip")
+            fi
+        done < <(nmap -sn -n --min-parallelism 100 "$NET_CIDR" 2>/dev/null)
+    fi
+
+    # Coletar vizinhos da tabela ARP do kernel (capta máquinas ativas mesmo que filtrem ping)
+    while read -r linha; do
+        local vip
+        vip=$(echo "$linha" | awk '{print $1}')
+        if [[ "$vip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ips_descobertos+=("$vip")
+        fi
+    done < <(ip -4 neigh show dev "$NET_IFACE" 2>/dev/null | grep -E "REACHABLE|DELAY|STALE")
+
+    # Incluir sempre Gateway e IP local
+    [ -n "$NET_GW" ] && ips_descobertos+=("$NET_GW")
+    [ -n "$LOCAL_IP" ] && ips_descobertos+=("$LOCAL_IP")
+
+    # Mapear máquinas já cadastradas em hosts.conf (incluindo linhas comentadas para respeitar escolhas do usuário)
+    declare -A hosts_cadastrados
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='|' read -r raw_ip raw_name || [ -n "$raw_ip" ]; do
+            local clean_ip
+            clean_ip=$(echo "$raw_ip" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            clean_ip="${clean_ip#\#}"
+            clean_ip=$(echo "$clean_ip" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$clean_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                hosts_cadastrados["$clean_ip"]=1
+            fi
+        done < "$CONFIG_FILE"
+    else
         cat <<EOF > "$CONFIG_FILE"
 # ==============================================================================
 # BASE DE COMPUTADORES LOCAIS (RETRO NET-WATCH)
@@ -158,20 +283,62 @@ inicializar_hosts() {
 # Linhas iniciadas com '#' são ignoradas.
 # ==============================================================================
 EOF
-        # Adiciona o Gateway real se detectado
-        if [ -n "$gw" ]; then
-            echo "$gw | Roteador Gateway Principal" >> "$CONFIG_FILE"
-        fi
-
-        # Adiciona vizinhos reais presentes na tabela ARP local
-        while read -r linha; do
-            local vip
-            vip=$(echo "$linha" | awk '{print $1}')
-            if [[ "$vip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$vip" != "$gw" ]; then
-                echo "$vip | Dispositivo Rede Local ($vip)" >> "$CONFIG_FILE"
-            fi
-        done < <(ip -4 neigh show 2>/dev/null | grep -E "REACHABLE|DELAY|STALE")
     fi
+
+    # Ordenar e filtrar IPs únicos
+    local ips_unicos=()
+    while read -r ip_u; do
+        [ -n "$ip_u" ] && ips_unicos+=("$ip_u")
+    done < <(printf "%s\n" "${ips_descobertos[@]}" | sort -u -V)
+
+    local novos_encontrados=0
+    local total_encontrados=${#ips_unicos[@]}
+
+    for ip in "${ips_unicos[@]}"; do
+        if [ -z "${hosts_cadastrados[$ip]}" ]; then
+            local nome_auto
+            nome_auto=$(resolver_nome_dispositivo "$ip" "${map_hints[$ip]}")
+            printf "%-16s | %s\n" "$ip" "$nome_auto" >> "$CONFIG_FILE"
+            hosts_cadastrados["$ip"]=1
+            ((novos_encontrados++))
+            if [ "$modo_silencioso" -eq 0 ]; then
+                printf " %s[+] NOVO COMPUTADOR IDENTIFICADO:%s %-16s -> %s\n" "${C_ONLINE}${BOLD}" "${RESET}" "$ip" "$nome_auto"
+            fi
+        else
+            if [ "$modo_silencioso" -eq 0 ]; then
+                printf " %s[•] COMPUTADOR JÁ REGISTRADO:%s    %-16s\n" "${C_DIM}" "${RESET}" "$ip"
+            fi
+        fi
+    done
+
+    if [ "$modo_silencioso" -eq 0 ]; then
+        echo ""
+        echo "───────────────────────────────────────────────────────────────────────────────"
+        printf " %sMétodo utilizado:%s %s\n" "${C_PRIMARY}" "${RESET}" "$metodo_scan"
+        printf " %sTotal de nós ativos na sub-rede:%s %d\n" "${C_PRIMARY}" "${RESET}" "$total_encontrados"
+        printf " %sNovos computadores adicionados ao monitor:%s %d\n" "${C_ONLINE}" "${RESET}" "$novos_encontrados"
+        echo "───────────────────────────────────────────────────────────────────────────────"
+    fi
+
+    return 0
+}
+
+# Inicialização da base de computadores com varredura automática da rede local
+inicializar_hosts() {
+    detectar_configuracao_rede
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat <<EOF > "$CONFIG_FILE"
+# ==============================================================================
+# BASE DE COMPUTADORES LOCAIS (RETRO NET-WATCH)
+# Formato: ENDERECO_IP | NOME_DESCRITIVO
+# Linhas iniciadas com '#' são ignoradas.
+# ==============================================================================
+EOF
+        [ -n "$NET_GW" ] && printf "%-16s | %s\n" "$NET_GW" "Roteador Gateway Principal" >> "$CONFIG_FILE"
+        [ -n "$LOCAL_IP" ] && printf "%-16s | %s\n" "$LOCAL_IP" "Esta Maquina Local (${HOSTNAME:-Linux})" >> "$CONFIG_FILE"
+    fi
+    # Executa varredura automática para identificar máquinas ativas na rede local
+    descobrir_maquinas_rede 1
 }
 
 # ------------------------------------------------------------------------------
@@ -188,7 +355,9 @@ desenhar_cabecalho() {
     printf " ║%s%s  ██║ ╚████║███████╗   ██║      ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║                 %s║\n" "${C_PRIMARY}" "${BOLD}" "${C_BORDER}"
     printf " ║%s%s  ╚═╝  ╚═══╝╚══════╝   ╚═╝      ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝                 %s║\n" "${C_PRIMARY}" "${BOLD}" "${C_BORDER}"
     printf " ║%s             [ SISTEMA RETRO DE MONITORAMENTO DE REDE LOCAL ]                   %s║\n" "${C_DIM}" "${C_BORDER}"
-    printf " ║%s   Ambiente: 100%% Offline  •  Tema: %-26s  •  v1.0   %s║\n" "${C_ACCENT}" "$THEME_NAME" "${C_BORDER}"
+    local info_linha
+    info_linha=$(printf "  Rede: %-14s • IP Local: %-13s • Dev: %-6s • %-13s  " "${NET_CIDR:-LAN}" "${LOCAL_IP:-127.0.0.1}" "${NET_IFACE:-eth0}" "$THEME_NAME")
+    printf " ║%s%s%s║\n" "${C_ACCENT}" "$info_linha" "${C_BORDER}"
     echo " ╚══════════════════════════════════════════════════════════════════════════════╝"
     printf "%s" "${RESET}"
 }
@@ -262,11 +431,7 @@ renderizar_tabela_resultados() {
     if [ ! -e "${arqs[0]}" ]; then
         printf " │ %s%-74s%s │\n" "${C_OFFLINE}" "  [!] Nenhum computador configurado em hosts.conf." "${RESET}${C_BORDER}"
     else
-        local total_arquivos
-        total_arquivos=$(ls -1v "$TMP_DIR"/host_*.tmp 2>/dev/null | wc -l)
-
-        for ((i=0; i<total_arquivos; i++)); do
-            local arq="$TMP_DIR/host_${i}.tmp"
+        for arq in $(ls -1v "$TMP_DIR"/host_*.tmp 2>/dev/null); do
             [ ! -f "$arq" ] && continue
 
             IFS='|' read -r status latencia ip nome < "$arq"
@@ -276,7 +441,11 @@ renderizar_tabela_resultados() {
             local c_txt
             if [ "$status" = "UP" ]; then
                 ((total_online++))
-                tag_status="[  ONLINE  ]"
+                if [ -n "$LOCAL_IP" ] && [ "$ip" = "$LOCAL_IP" ]; then
+                    tag_status="[  LOCAL*  ]"
+                else
+                    tag_status="[  ONLINE  ]"
+                fi
                 c_st="${C_ONLINE}${BOLD}"
                 c_txt="${C_BRIGHT}"
             else
@@ -320,13 +489,35 @@ monitoramento_continuo() {
     tput civis 2>/dev/null || printf '\033[?25l'
     local ciclo=1
 
+    # Varredura inicial para garantir que todas as máquinas na rede local estejam identificadas
+    desenhar_cabecalho
+    printf "%s\n 🔍 Realizando varredura na rede local (%s) para identificar computadores...%s\n" "${C_ACCENT}" "${NET_CIDR:-LAN}" "${RESET}"
+    descobrir_maquinas_rede 1
+
+    local bg_discovery_pid=""
+
     while true; do
+        # Se autodescoberta em segundo plano terminou, coleta status
+        if [ -n "$bg_discovery_pid" ] && ! kill -0 "$bg_discovery_pid" 2>/dev/null; then
+            wait "$bg_discovery_pid" 2>/dev/null
+            bg_discovery_pid=""
+        fi
+
+        # A cada 3 ciclos (~30s), se AUTO_DISCOVERY estiver ativado, efetua nova varredura em background
+        if [ "${AUTO_DISCOVERY:-1}" -eq 1 ] && [ $((ciclo % 3)) -eq 0 ] && [ -z "$bg_discovery_pid" ]; then
+            ( descobrir_maquinas_rede 1 >/dev/null 2>&1 ) &
+            bg_discovery_pid=$!
+        fi
+
         executar_varredura_paralela
         desenhar_cabecalho
         renderizar_tabela_resultados
 
+        local status_auto="Ativa"
+        [ "${AUTO_DISCOVERY:-1}" -eq 0 ] && status_auto="Desativada"
+
         printf "%s" "${C_ACCENT}"
-        printf " » MONITORAMENTO CONTÍNUO ATIVO (Varredura a cada %ds | Ciclo #%d)\n" "$REFRESH_RATE" "$ciclo"
+        printf " » MONITORAMENTO CONTÍNUO ATIVO (Varredura: %ds | Auto-Descoberta LAN: %s | Ciclo #%d)\n" "$REFRESH_RATE" "$status_auto" "$ciclo"
         echo " » Pressione [0] ou [Q] para interromper e voltar ao menu principal..."
         printf "%s" "${RESET}"
 
@@ -339,6 +530,9 @@ monitoramento_continuo() {
         ((ciclo++))
     done
 
+    # Finaliza processo em background caso ainda esteja rodando ao sair
+    [ -n "$bg_discovery_pid" ] && kill "$bg_discovery_pid" 2>/dev/null
+
     tput cnorm 2>/dev/null || printf '\033[?25h'
 }
 
@@ -347,7 +541,8 @@ monitoramento_continuo() {
 # ------------------------------------------------------------------------------
 varredura_unica() {
     desenhar_cabecalho
-    printf "%s Executando varredura rápida na rede local... Aguarde.%s\n\n" "${C_ACCENT}" "${RESET}"
+    printf "%s 🔍 Executando varredura na rede local (%s) e identificando máquinas... Aguarde.%s\n\n" "${C_ACCENT}" "${NET_CIDR:-LAN}" "${RESET}"
+    descobrir_maquinas_rede 1
     executar_varredura_paralela
     desenhar_cabecalho
     renderizar_tabela_resultados
@@ -366,16 +561,17 @@ gerenciar_computadores() {
         echo " ┌──[ GERENCIAMENTO DE COMPUTADORES MONITORADOS ]───────────────────────────────┐"
         echo " │                                                                              │"
         echo " │  [1] Listar todos os computadores cadastrados                                │"
-        echo " │  [2] Adicionar novo computador                                               │"
+        echo " │  [2] Adicionar novo computador manualmente                                   │"
         echo " │  [3] Remover computador da lista                                             │"
         echo " │  [4] Diagnóstico detalhado de um computador (Ping Extendido)                 │"
-        echo " │  [5] Autodescobrir dispositivos vizinhos na rede local                       │"
+        echo " │  [5] Varrer e autodescobrir máquinas na rede local agora                     │"
+        printf " │  [6] Alternar Autodescoberta Contínua [Atual: %-10s]                   │\n" "$([ "${AUTO_DISCOVERY:-1}" -eq 1 ] && echo "ATIVADA" || echo "DESATIVADA")"
         echo " │                                                                              │"
         echo " │  [0] Voltar ao Menu Principal                                                │"
         echo " │                                                                              │"
         echo " └──────────────────────────────────────────────────────────────────────────────┘"
         printf "%s" "${RESET}"
-        printf "%s Escolha uma opção [0-5]: %s" "${C_BRIGHT}" "${RESET}"
+        printf "%s Escolha uma opção [0-6]: %s" "${C_BRIGHT}" "${RESET}"
         read -r sub_opt
 
         case "$sub_opt" in
@@ -472,42 +668,26 @@ gerenciar_computadores() {
                 ;;
             5)
                 desenhar_cabecalho
-                printf "%s=== AUTODESCOBERTA DE VIZINHOS NA REDE LOCAL (ARP CACHE) ===%s\n" "${C_ACCENT}" "${RESET}"
-                printf "%sConsulta a tabela de vizinhos do kernel Linux (100%% offline e seguro)%s\n\n" "${C_DIM}" "${RESET}"
-                
-                local vizinhos=()
-                while read -r linha; do
-                    local vip
-                    vip=$(echo "$linha" | awk '{print $1}')
-                    if [[ "$vip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                        vizinhos+=("$vip")
-                    fi
-                done < <(ip -4 neigh show 2>/dev/null | grep -E "REACHABLE|DELAY|STALE")
-
-                if [ ${#vizinhos[@]} -eq 0 ]; then
-                    echo "Nenhum vizinho ativo detectado no cache ARP imediato."
-                else
-                    echo "Dispositivos detectados na rede local:"
-                    local c=1
-                    for v in "${vizinhos[@]}"; do
-                        printf "  [%d] %s\n" "$c" "$v"
-                        ((c++))
-                    done
-                    echo ""
-                    printf "%sDeseja adicionar algum IP à lista de monitoramento? (digite o IP ou [0] para voltar): %s" "${C_BRIGHT}" "${RESET}"
-                    read -r add_vip
-                    if [ "$add_vip" != "0" ] && [ -n "$add_vip" ]; then
-                        printf "%sNome descritivo para %s: %s" "${C_BRIGHT}" "$add_vip" "${RESET}"
-                        read -r vnome
-                        [ -z "$vnome" ] && vnome="Dispositivo $add_vip"
-                        echo "$add_vip | $vnome" >> "$CONFIG_FILE"
-                        printf "%s[OK] Adicionado!%s\n" "${C_ONLINE}" "${RESET}"
-                        sleep 1
-                    fi
-                fi
+                descobrir_maquinas_rede 0
                 echo ""
-                printf "%sPressione [0] ou [ENTER] para voltar: %s" "${C_BRIGHT}" "${RESET}"
+                printf "%s Pressione [0] ou [ENTER] para voltar: %s" "${C_BRIGHT}" "${RESET}"
                 read -r _
+                ;;
+            6)
+                if [ "${AUTO_DISCOVERY:-1}" -eq 1 ]; then
+                    AUTO_DISCOVERY=0
+                else
+                    AUTO_DISCOVERY=1
+                fi
+                salvar_configuracoes
+                desenhar_cabecalho
+                printf "%s=== AUTODESCOBERTA CONTÍNUA ===%s\n\n" "${C_ACCENT}" "${RESET}"
+                if [ "$AUTO_DISCOVERY" -eq 1 ]; then
+                    printf "%s[OK] Autodescoberta contínua em segundo plano ATIVADA!%s\n" "${C_ONLINE}" "${RESET}"
+                else
+                    printf "%s[OK] Autodescoberta contínua em segundo plano DESATIVADA!%s\n" "${C_OFFLINE}" "${RESET}"
+                fi
+                sleep 1.5
                 ;;
             0)
                 break
@@ -625,6 +805,7 @@ menu_principal() {
 # PONTO DE ENTRADA DO SCRIPT
 # ------------------------------------------------------------------------------
 verificar_pre_requisitos
-inicializar_hosts
+detectar_configuracao_rede
 carregar_configuracoes
+inicializar_hosts
 menu_principal
